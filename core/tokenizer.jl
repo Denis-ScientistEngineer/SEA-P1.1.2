@@ -1,87 +1,121 @@
-# This is the user input string manipulation file
-# It takes in the input string and prepares it in a format usable by the solvers
-# Format : [Token] key = value pair
+module CommandParser
 
+export parse_request, ParsedRequest
 
-# ====== Step 1: Token structure =======
-# create the token structure
-struct Token
-    name::Symbol
-    value::Float64
-end
-
-
-# ====== Step 2: Request structure =======
+# ====== 1. Data Structure ======
 struct ParsedRequest
-    domain::String
-    command::String
-    variables::String
+    regime::Symbol
+    domain::Symbol
+    field::Symbol
+    command::Symbol
+    variables::Dict{Symbol, Float64}
 end
 
 
-# ====== Step 3: Extract Request parts =======
-function extractor(input::String)::Union{ParsedRequest, Nothing}
-    # 1. The main regex to split: [Domain] command : variables
-    # Format: [text] text : text
-    
-    structural_pattern = r"^\[\s*([^\]]+)\s*\]\s*([^:]+)\s*:\s*(.*)$"
+# ====== 2. Pre-compiled regex pattern Constants ======
+# move the regex patterns out of the function to avoid recompilation
+const STRUCT_PATTERN = r"^\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*([^:]+)\s*:\s*(.*)$"
+const VAR_PATTERN = r"([a-zA-Z]\w*)\s*=\s*(-?\d+(?:\.\d+)?(?:(?:[eE]|\s*\*\s*10\^)\s*[-+]?\d+)?)"
 
-    struct_match = match(structural_pattern, input)
+
+# ====== 3. Execution Function ======
+"""
+    Parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
+
+Extracts regime, domain, field, command, and variables from a structured input string. 
+Returns a `ParsedRequest` object if successful, or `nothing` if the input does not match the expected format.
+"""
+
+function parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
+    # Match against the precompiled pattern. 
+    # use strip(input) and let the regex handle the whitespace
+    # or handle it duing token extraction to avoid new stripped strings
+
+    struct_match = match(STRUCT_PATTERN, input)
 
     if struct_match === nothing
-        println("ERROR: Invalid Input format!")
-        println("   Expected layout = [Domain] command : variable1=value1, variable2=key2, ....")
-        return nothing
+        # scondary error check reporting only if the fast path fails
+        struct_match = match(STRUCT_PATTERN, strip(input))
+        if struct_match === nothing
+            @warn "Invalid Input Format!\nExpected layout = [Regime] [Domain] [Field] Command: var1=value1 var2=value2 ...\nReceived: $input"
+            return nothing
+        end
     end
 
 
-    # Extract metadata cleanly
-    domain = strip(struct_match.captures[1])
-    command = strip(struct_match.captures[2])
-    variables = struct_match.captures[3]
+    # Helper function using SubString view modifications instead of allocating new Strings
+    function clean_symbol(str::SubString)
+        #strip() on  SubString returns a SubString view (0 allocations)
+        stripped = strip(str)
+        if occursin(' ', stripped)
+            # Only allocate a new string if space actually exist to be removed
+            return Symbol(replace(stripped, " " => ""))
+        else
+            return Symbol(stripped)
+        end
+    end
 
-    return ParsedRequest(domain, command, variables)
-end
+    regime = clean_symbol(struct_match.captures[1])
+    domain = clean_symbol(struct_match.captures[2])
+    field = clean_symbol(struct_match.captures[3])
+    command = clean_symbol(struct_match.captures[4])
 
+    variable_string = struct_match.captures[5]
 
-# ===== Step 4: Tokenizer =====
-# we create the key = value pair e.g mass = 200
-function tokenizer(input::String)::Vector{Token}
-    tokens = Token[]
+    variables = Dict{Symbol, Float64}()
 
-    # define the regex pattern to look for
-    # quantity = value
-    pattern = r"[a-zA-Z][a-zA-Z0-9]\s*=\s*(-?\d+\.?\d*(?:[eE][-+]?\d+)?)"
-
-    for m in eachmatch(pattern, input)
-        raw_name = m.captures[1]
+    for m in eachmatch(VAR_PATTERN, variable_string)
+        name = Symbol(m.captures[1])
         raw_value = m.captures[2]
 
-        name = Symbol(raw_name)
-        value = parse(Float64, raw_value)
+        # Avoid allocating a new string via replace() unless there are actual space to strip
+        val_to_parse = occursin(' ', raw_val) ? replace(raw_val, " " => "") : raw_val
 
-        push!(tokens, Token(name, value))
+        if occursin("*10^", val_to_parse)
+            # findfirst returns indices, allowing us to split via SubString views instead of split() arrays
+            idx = findfirst("*10^", val_to_parse)
+            base_str = SubString(val_to_parse, 1, first(idx) - 1)
+            exp_str = SubString(val_to_parse, last(idx) + 1, lastindex(val_to_parse))
+
+            variables[name] = parse(Float64, base_str) * (10.0^parse(Float64, exp_str))
+        else
+            variables[name] = parse(Float64, val_to_parse)
+        end
     end
-    return tokens
+
+    return ParsedRequest(regime, domain, field, command, variables)
+end
+
 
 end
 
 
-# ===== Step 4: Convert tokens to dictionary ======
-function tokens_to_dictionary(tokens::Vector{Token})::Dict{Symbol, Float64}
-    return Dict(t.name => t.value for t in tokens)
+
+using BenchmarkTools
+using .CommandParser  # Assumes your module is loaded
+
+# 1. Define sample data
+const sample_input = "[Classical Mechanics] [Solid Mechanics] [Beam Deflection] calculate : force=2000.0, mass=400.0, length=5.5"
+
+# Create a mock batch of 5,000 requests to simulate a real-world workload
+const batch_inputs = fill(sample_input, 5000)
+
+println("=== BENCHMARKING SINGLE REQUEST ===")
+# @btime runs the function thousands of times, handles JIT heating, 
+# and prints the minimum execution time cleanly.
+@btime parse_request(sample_input)
+
+
+println("\n=== BENCHMARKING BATCH PROCESSING (5,000 Lines) ===")
+# This tracks how your parser scales when dealing with massive data loads
+function process_all_requests(inputs)
+    # pre-allocate an array to hold results so we don't time array growth overhead
+    results = Vector{Union{ParsedRequest, Nothing}}(undef, length(inputs))
+    
+    for i in eachindex(inputs)
+        results[i] = parse_request(inputs[i])
+    end
+    return results
 end
 
-
-
-
-
-inp = "[point charge] get electric field : q=2 F=200"
-#extractor(inp)
-values = extractor(inp)
-
-(; domain, command, variables) = values
-vars = values.variables
-
-token_array = tokenizer(vars)
-tokens_to_dictionary(vars)
+@btime process_all_requests(batch_inputs)
