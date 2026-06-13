@@ -1,95 +1,121 @@
+module CommandParser
 
+export parse_request, ParsedRequest
 
-# ==== 1. Data Structures ====
-struct Token
-    name::Symbol
-    value::Float64
-end
-
+# ====== 1. Data Structure ======
 struct ParsedRequest
+    regime::Symbol
     domain::Symbol
+    field::Symbol
     command::Symbol
     variables::Dict{Symbol, Float64}
 end
 
-# ==== 2. Main Interface ====
 
-"""
-    parse_request(input::String)::Union{ParsedRequest, Nothing}
+# ====== 2. Pre-compiled regex pattern Constants ======
+# move the regex patterns out of the function to avoid recompilation
+const STRUCT_PATTERN = r"^\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*([^:]+)\s*:\s*(.*)$"
+const VAR_PATTERN = r"([a-zA-Z]\w*)\s*=\s*(-?\d+(?:\.\d+)?(?:(?:[eE]|\s*\*\s*10\^)\s*[-+]?\d+)?)"
 
-Extracts the domain, command, and variables from a formatted string.
-Expected layout: `[Domain] command : var1=val1 var2=val2 ...`
+
+# ====== 3. Execution Function ======
 """
-function parse_request(input::String)::Union{ParsedRequest, Nothing}
-    # Structural Regex: matches [Domain] command : variables
-    structural_pattern = r"^\[\s*([^\]]+)\s*\]\s*([^:]+)\s*:\s*(.*)$"
-    
-    struct_match = match(structural_pattern, strip(input))
+    Parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
+
+Extracts regime, domain, field, command, and variables from a structured input string. 
+Returns a `ParsedRequest` object if successful, or `nothing` if the input does not match the expected format.
+"""
+
+function parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
+    # Match against the precompiled pattern. 
+    # use strip(input) and let the regex handle the whitespace
+    # or handle it duing token extraction to avoid new stripped strings
+
+    struct_match = match(STRUCT_PATTERN, input)
 
     if struct_match === nothing
-        @warn "Invalid Input format!\nExpected layout = [Domain] command : variable1=value1 ..."
-        return nothing
+        # scondary error check reporting only if the fast path fails
+        struct_match = match(STRUCT_PATTERN, strip(input))
+        if struct_match === nothing
+            @warn "Invalid Input Format!\nExpected layout = [Regime] [Domain] [Field] Command: var1=value1 var2=value2 ...\nReceived: $input"
+            return nothing
+        end
     end
 
-    # Extract primary components
-    domain = Symbol(strip(struct_match.captures[1]))
-    command = Symbol(strip(struct_match.captures[2]))
-    variable_string = struct_match.captures[3]
-    
-    # Tokenize and convert directly to a Dictionary
-    tokens = tokenize_variables(variable_string)
-    variables = Dict{Symbol, Float64}(t.name => t.value for t in tokens)
 
-    return ParsedRequest(domain, command, variables)
-end
+    # Helper function using SubString view modifications instead of allocating new Strings
+    function clean_symbol(str::SubString)
+        #strip() on  SubString returns a SubString view (0 allocations)
+        stripped = strip(str)
+        if occursin(' ', stripped)
+            # Only allocate a new string if space actually exist to be removed
+            return Symbol(replace(stripped, " " => ""))
+        else
+            return Symbol(stripped)
+        end
+    end
 
-# ==== 3. Parsing Engine ====
+    regime = clean_symbol(struct_match.captures[1])
+    domain = clean_symbol(struct_match.captures[2])
+    field = clean_symbol(struct_match.captures[3])
+    command = clean_symbol(struct_match.captures[4])
 
-"""
-    tokenize_variables(input::String)::Vector{Token}
+    variable_string = struct_match.captures[5]
 
-Extracts variable names and their numerical values from the remaining string.
-"""
-function tokenize_variables(input::AbstractString)::Vector{Token}
-    tokens = Token[]
-    
-    # Robust Regex: Captures names and numbers (Int, Float, Scientific, and *10^)
-    # Examples it catches: mass = 400, vel = -3.14, force = 2e3, pressure = 5 * 10^-2
-    pattern = r"([a-zA-Z]\w*)\s*=\s*(-?\d+(?:\.\d+)?(?:(?:[eE]|\s*\*\s*10\^)\s*[-+]?\d+)?)"
+    variables = Dict{Symbol, Float64}()
 
-    for m in eachmatch(pattern, input)
-        raw_name = m.captures[1]
+    for m in eachmatch(VAR_PATTERN, variable_string)
+        name = Symbol(m.captures[1])
         raw_value = m.captures[2]
 
-        name = Symbol(raw_name)
-        value = parse_numeric_value(raw_value)
+        # Avoid allocating a new string via replace() unless there are actual space to strip
+        val_to_parse = occursin(' ', raw_val) ? replace(raw_val, " " => "") : raw_val
 
-        push!(tokens, Token(name, value))
+        if occursin("*10^", val_to_parse)
+            # findfirst returns indices, allowing us to split via SubString views instead of split() arrays
+            idx = findfirst("*10^", val_to_parse)
+            base_str = SubString(val_to_parse, 1, first(idx) - 1)
+            exp_str = SubString(val_to_parse, last(idx) + 1, lastindex(val_to_parse))
+
+            variables[name] = parse(Float64, base_str) * (10.0^parse(Float64, exp_str))
+        else
+            variables[name] = parse(Float64, val_to_parse)
+        end
     end
 
-    return tokens
-end
-
-"""
-    parse_numeric_value(raw_value::AbstractString)::Float64
-
-Handles standard floats and custom `* 10^` notation.
-"""
-function parse_numeric_value(raw_value::AbstractString)::Float64
-    # Clean up whitespace to make splitting foolproof
-    cleaned_value = replace(raw_value, " " => "")
-
-    if contains(cleaned_value, "*10^")
-        parts = split(cleaned_value, "*10^")
-        base = parse(Float64, parts[1])
-        exponent = parse(Float64, parts[2])
-        return base * (10.0^exponent)
-    else
-        return parse(Float64, cleaned_value)
-    end
+    return ParsedRequest(regime, domain, field, command, variables)
 end
 
 
-test = "[point charge] get electric field : q = 1e-6 distance = 10"
-answ = parse_request(test)
-@time println(answ)
+end
+
+
+
+using BenchmarkTools
+using .CommandParser  # Assumes your module is loaded
+
+# 1. Define sample data
+const sample_input = "[Classical Mechanics] [Solid Mechanics] [Beam Deflection] calculate : force=2000.0, mass=400.0, length=5.5"
+
+# Create a mock batch of 5,000 requests to simulate a real-world workload
+const batch_inputs = fill(sample_input, 5000)
+
+println("=== BENCHMARKING SINGLE REQUEST ===")
+# @btime runs the function thousands of times, handles JIT heating, 
+# and prints the minimum execution time cleanly.
+@btime parse_request(sample_input)
+
+
+println("\n=== BENCHMARKING BATCH PROCESSING (5,000 Lines) ===")
+# This tracks how your parser scales when dealing with massive data loads
+function process_all_requests(inputs)
+    # pre-allocate an array to hold results so we don't time array growth overhead
+    results = Vector{Union{ParsedRequest, Nothing}}(undef, length(inputs))
+    
+    for i in eachindex(inputs)
+        results[i] = parse_request(inputs[i])
+    end
+    return results
+end
+
+@btime process_all_requests(batch_inputs)
