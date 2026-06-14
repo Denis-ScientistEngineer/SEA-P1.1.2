@@ -87,6 +87,35 @@ function parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
 end
 
 
-end # module
+end
 
 
+
+using BenchmarkTools
+using .CommandParser  # Assumes your module is loaded
+
+# 1. Define sample data
+const sample_input = "[Classical Mechanics] [Solid Mechanics] [Beam Deflection] calculate : force=2000.0, mass=400.0, length=5.5"
+
+# Create a mock batch of 5,000 requests to simulate a real-world workload
+const batch_inputs = fill(sample_input, 5000)
+
+println("=== BENCHMARKING SINGLE REQUEST ===")
+# @btime runs the function thousands of times, handles JIT heating, 
+# and prints the minimum execution time cleanly.
+@btime parse_request(sample_input)
+
+
+println("\n=== BENCHMARKING BATCH PROCESSING (5,000 Lines) ===")
+# This tracks how your parser scales when dealing with massive data loads
+function process_all_requests(inputs)
+    # pre-allocate an array to hold results so we don't time array growth overhead
+    results = Vector{Union{ParsedRequest, Nothing}}(undef, length(inputs))
+    
+    for i in eachindex(inputs)
+        results[i] = parse_request(inputs[i])
+    end
+    return results
+end
+
+@btime process_all_requests(batch_inputs)
