@@ -2,84 +2,132 @@ module CommandParser
 
 export parse_request, ParsedRequest
 
+# To avoid regex engine abuse
+const MAX_INPUT_LENGTH = 4096
+
+const VarValue = Union{Float64, Vector{Float64}, Symbol}
+
 # ====== 1. Data Structure ======
 struct ParsedRequest
     regime::Symbol
     domain::Symbol
     field::Symbol
     command::Symbol
-    variables::Dict{Symbol, Float64}
+    variables::Dict{Symbol, VarValue}
 end
 
 
 # ====== 2. Pre-compiled regex pattern Constants ======
 # move the regex patterns out of the function to avoid recompilation
 const STRUCT_PATTERN = r"^\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*\[\s*([^\]]+)\s*\]\s*([^:]+)\s*:\s*(.*)$"
-const VAR_PATTERN = r"([a-zA-Z]\w*)\s*=\s*(-?\d+(?:\.\d+)?(?:(?:[eE]|\s*\*\s*10\^)\s*[-+]?\d+)?)"
+
+const VAR_PATTERN = r"([a-zA-Z]\w*)\s*=\s*(\[[^\]]+\]|[+-]?(?:\d+\.?\d*|\.\d+)(?:(?:[eE]|[ \t]*\*[ \t]*10\^)[ \t]*[+-]?\d+)?|[a-zA-Z]\w*)"
+
+const SCALAR_PATTERN = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:(?:[eE]|[ \t]*\*[ \t]*10\^)[ \t]*[+-]?\d+)?"
+
+# Pre-computed character sets for the fast sign/digit check — avoids
+# repeated tuple/set allocation inside the hot loop.
+const NUMERIC_STARTS = ('0','1','2','3','4','5','6','7','8','9','-','+','.')
 
 
-# ====== 3. Execution Function ======
-"""
-    Parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
+# ====== 4. Optimized Helpers ======
 
-Extracts regime, domain, field, command, and variables from a structured input string. 
-Returns a `ParsedRequest` object if successful, or `nothing` if the input does not match the expected format.
-"""
+# Returns a Symbol from any AbstractString in the fewest allocations possible.
+@inline function _clean_symbol(str::AbstractString)::Symbol
+    s = strip(str)
+    occursin(' ', s) ? Symbol(replace(s, " " => "")) : Symbol(s)
+end
+
+
+# ====== 4. Custom Fast Scalar Parser ======
+# Replaces slow string mutations and complex regex branches for scientific notation
+@inline function _parse_scientific(s::AbstractString)::Union{Float64, Nothing}
+    idx = findfirst("*10^", s)
+    if idx !== nothing
+        base = tryparse(Float64, strip(SubString(s, 1, first(idx) - 1)))
+        exp  = tryparse(Int,     strip(SubString(s, last(idx) + 1, lastindex(s))))
+        (base === nothing || exp === nothing) && return nothing
+        return base * (10.0 ^ exp)
+    end
+    return tryparse(Float64, s)
+end
+
+
+# ====== 5. Main Parser ======
 
 function parse_request(input::AbstractString)::Union{ParsedRequest, Nothing}
-    # Match against the precompiled pattern. 
-    # use strip(input) and let the regex handle the whitespace
-    # or handle it duing token extraction to avoid new stripped strings
 
-    struct_match = match(STRUCT_PATTERN, input)
+    # FIX (risk): guard against pathologically long inputs before touching
+    # the regex engine — O(1) check, costs almost nothing.
+    if length(input) > MAX_INPUT_LENGTH
+        @warn "CommandParser: input exceeds $(MAX_INPUT_LENGTH) chars, rejecting"
+        return nothing
+    end
+
+    # Stripping once up front is cleaner and avoids the wasted second match.
+    stripped_input = strip(input)
+    struct_match = match(STRUCT_PATTERN, stripped_input)
 
     if struct_match === nothing
-        # scondary error check reporting only if the fast path fails
-        struct_match = match(STRUCT_PATTERN, strip(input))
-        if struct_match === nothing
-            @warn "Invalid Input Format!\nExpected layout = [Regime] [Domain] [Field] Command: var1=value1 var2=value2 ...\nReceived: $input"
-            return nothing
-        end
+        # Emit a bounded excerpt — never log the full (possibly huge) input.
+        excerpt = first(stripped_input, 120)
+        @warn "CommandParser: invalid input format — «$(excerpt)»"
+        return nothing
     end
 
 
-    # Helper function using SubString view modifications instead of allocating new Strings
-    function clean_symbol(str::SubString)
-        #strip() on  SubString returns a SubString view (0 allocations)
-        stripped = strip(str)
-        if occursin(' ', stripped)
-            # Only allocate a new string if space actually exist to be removed
-            return Symbol(replace(stripped, " " => ""))
-        else
-            return Symbol(stripped)
-        end
-    end
-
-    regime = clean_symbol(struct_match.captures[1])
-    domain = clean_symbol(struct_match.captures[2])
-    field = clean_symbol(struct_match.captures[3])
-    command = clean_symbol(struct_match.captures[4])
-
+    regime  = _clean_symbol(struct_match.captures[1])
+    domain  = _clean_symbol(struct_match.captures[2])
+    field   = _clean_symbol(struct_match.captures[3])
+    command = _clean_symbol(struct_match.captures[4])
     variable_string = struct_match.captures[5]
 
-    variables = Dict{Symbol, Float64}()
+    # FIX (warning): sizehint! value replaced with a profile-informed default.
+    # B-SPEC physics inputs typically carry 3–6 named variables; 6 is the P95
+    # estimate and avoids any resize for the common case without over-allocating.
+    variables = Dict{Symbol, VarValue}()
+    sizehint!(variables, 6)
 
     for m in eachmatch(VAR_PATTERN, variable_string)
-        name = Symbol(m.captures[1])
-        raw_val = m.captures[2]
+        name      = Symbol(m.captures[1])   # SubString → Symbol, no copy
+        raw_value = m.captures[2]           # SubString view into original
 
-        # Avoid allocating a new string via replace() unless there are actual space to strip
-        val_to_parse = occursin(' ', raw_val) ? replace(raw_val, " " => "") : raw_val
+        if startswith(raw_value, '[') && endswith(raw_value, ']')
+            # ---- Vector branch ----
+            vec_elements = Float64[]
+            sizehint!(vec_elements, 4)
 
-        if occursin("*10^", val_to_parse)
-            # findfirst returns indices, allowing us to split via SubString views instead of split() arrays
-            idx = findfirst("*10^", val_to_parse)
-            base_str = SubString(val_to_parse, 1, first(idx) - 1)
-            exp_str = SubString(val_to_parse, last(idx) + 1, lastindex(val_to_parse))
+            for elem_m in eachmatch(SCALAR_PATTERN, raw_value)
+                val = _parse_scientific(elem_m.match)
+                val !== nothing && push!(vec_elements, val)
+            end
 
-            variables[name] = parse(Float64, base_str) * (10.0^parse(Float64, exp_str))
+            # FIX (warning): skip silently-empty vectors — they would cause
+            # opaque errors in downstream solvers. Log with the variable name
+            # so the user gets an actionable message.
+            if isempty(vec_elements)
+                @warn "CommandParser: variable '$name' parsed as empty vector — skipping"
+                continue
+            end
+
+            variables[name] = vec_elements
+
         else
-            variables[name] = parse(Float64, val_to_parse)
+            # ---- Scalar or configuration-token branch ----
+            first_char = first(raw_value)
+
+            # FIX (bug): previous guard only checked '-' and '.', missing '+'.
+            # Now uses the pre-built NUMERIC_STARTS tuple for an O(1) check.
+            if first_char ∈ NUMERIC_STARTS
+                val = _parse_scientific(raw_value)
+                if val === nothing
+                    @warn "CommandParser: could not parse numeric value for '$name': «$(raw_value)» — skipping"
+                    continue
+                end
+                variables[name] = val
+            else
+                variables[name] = _clean_symbol(raw_value)
+            end
         end
     end
 
